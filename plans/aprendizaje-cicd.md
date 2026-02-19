@@ -72,31 +72,61 @@ docker compose logs -f web
 
 ---
 
-## Fase 2 — CI con GitHub Actions
+## Fase 2 — CI con GitHub Actions ✅
 
 **Objetivo:** cada push o PR ejecuta los tests automáticamente en GitHub.
 
-### Lo que se va a construir
+### Lo que se construyó
 
-- Workflow `.github/workflows/ci.yml` que se dispara en:
-  - Push a `main` o `develop`
-  - Pull requests hacia `main` o `develop`
-- Pasos del workflow:
+- `ruff` agregado a `requirements/local.txt` como herramienta de linting
+- Workflow `.github/workflows/ci.yml` con 8 pasos:
   1. Checkout del código
-  2. Levantar servicio PostgreSQL en el runner de GitHub
-  3. Instalar dependencias Python
-  4. Correr `migrate`
-  5. Correr los 15 tests
-  6. (Opcional) Linting con `ruff`
-- Protección de ramas en GitHub:
-  - `main` solo acepta merge si el CI pasa
-  - Requiere Pull Request — nadie hace push directo a main
+  2. Configurar Python 3.12 con cache de pip
+  3. Instalar dependencias del sistema (`libpq-dev`)
+  4. Instalar dependencias Python
+  5. Linting con `ruff` — falla rápido antes de correr tests
+  6. Verificar migraciones pendientes (`makemigrations --check --dry-run`)
+  7. Aplicar migraciones
+  8. Correr las 15 pruebas con `--verbosity=2`
 
-### Conceptos clave
+### Lecciones aprendidas
 
-- Los runners de GitHub Actions tienen Docker disponible, pero es más rápido usar servicios nativos (`services:`) que levantar docker-compose completo.
-- Los secrets de GitHub (Settings → Secrets) reemplazan al `.env` en el CI.
-- El `DJANGO_SETTINGS_MODULE` en el CI apunta a `config.settings.local` con una DB de test.
+- En GitHub Actions los servicios (postgres) son accesibles en `localhost`, no por nombre de servicio como en docker-compose.
+- El archivo `.env` no existe en el runner — las variables de entorno se declaran en la sección `env:` del workflow.
+- `makemigrations --check --dry-run` falla si hay cambios en modelos sin migración generada — protege producción de tablas desactualizadas.
+- El linting va **antes** de los tests para fallar rápido y no desperdiciar tiempo de CI.
+- `ruff` va en `local.txt` y no en `base.txt` — es una herramienta de dev, no una dependencia de producción.
+- El cache de pip (`cache: "pip"`) evita reinstalar dependencias en cada ejecución si `local.txt` no cambió.
+
+### Protección de ramas (configurar en GitHub)
+
+Para que el CI sea obligatorio antes de hacer merge:
+
+1. Ir a **Settings → Branches → Add rule**
+2. Branch name pattern: `main`
+3. Activar: **Require status checks to pass before merging**
+4. Seleccionar el check: `Linting y pruebas`
+5. Activar: **Require a pull request before merging**
+6. Repetir para `develop`
+
+### Estructura del workflow
+
+```
+on: push/PR a main o develop
+  │
+  └── job: test (ubuntu-latest)
+        │
+        ├── service: postgres:16-alpine
+        │
+        ├── step 1: checkout
+        ├── step 2: setup python + cache pip
+        ├── step 3: apt-get libpq-dev
+        ├── step 4: pip install requirements/local.txt
+        ├── step 5: ruff check .
+        ├── step 6: makemigrations --check
+        ├── step 7: migrate
+        └── step 8: test apps.todos
+```
 
 ---
 
