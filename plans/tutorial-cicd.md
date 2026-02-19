@@ -13,10 +13,13 @@ a `develop`, y deploy a producción al mergear a `main`.
 | Aplicación | Django 5.1 + Django REST Framework |
 | Base de datos | PostgreSQL 18 (separada de la app) |
 | Contenedores local | Docker + docker-compose |
+| Contenedores producción | Docker + docker-compose (misma imagen que local) |
+| Registry de imágenes | DigitalOcean Container Registry (DOCR) |
 | Control de versiones | Git + GitHub |
-| CI | GitHub Actions |
-| CD | GitHub Actions → SSH → Droplets DigitalOcean |
-| Servidor web | Nginx (reverse proxy) + Gunicorn (WSGI) |
+| CI | GitHub Actions — tests + build + push imagen |
+| CD | GitHub Actions → SSH → docker pull → restart |
+| Servidor WSGI | Gunicorn (dentro del contenedor) |
+| Archivos estáticos | WhiteNoise (dentro del contenedor, sin Nginx separado) |
 | Infraestructura | 2 Droplets Ubuntu + Managed PostgreSQL |
 
 ## Prerequisitos
@@ -819,7 +822,29 @@ Una vez creado el Droplet, conectarte así:
 ssh root@<IP_DEL_DROPLET>
 ```
 
-### 3.5 Configurar fuentes confiables en PostgreSQL
+### 3.5 Crear el DigitalOcean Container Registry (DOCR)
+
+El registry es el almacén donde se guardan las imágenes Docker. El CI construye
+la imagen y la sube aquí; el Droplet la baja desde aquí en cada deploy.
+
+En DigitalOcean: **Container Registry → Create Registry**
+
+| Campo | Valor |
+|-------|-------|
+| Nombre | `todos-registry` (o el que prefieras) |
+| Plan | Starter — **Gratis** hasta 500 MB |
+| Datacenter | El mismo que los Droplets (NYC3) |
+
+Después de crear el registry, anota el nombre del endpoint. Tendrá esta forma:
+```
+registry.digitalocean.com/todos-registry
+```
+
+> **500 MB es suficiente para este proyecto.** Una imagen Django básica con sus
+> dependencias pesa ~200-350 MB. Si el proyecto crece y supera ese límite, el plan
+> Basic cuesta $5/mes con 5 GB.
+
+### 3.6 Configurar fuentes confiables en PostgreSQL
 
 En DigitalOcean: **tu-cluster → Settings → Trusted sources**
 
@@ -827,7 +852,53 @@ Agregar ambos droplets como fuentes confiables. DigitalOcean los detecta automá
 si están en el mismo proyecto y región. Esto hace que la conexión vaya por la **red privada**
 sin exponerse a internet.
 
-### 3.6 Preparar los Droplets
+### 3.7 Preparar la imagen Docker para producción
+
+El enfoque Docker en producción usa **la misma imagen que en desarrollo** —
+esa consistencia es el gran beneficio de Docker.
+
+Agregar `whitenoise` a `requirements/base.txt` para servir archivos estáticos
+sin necesitar Nginx separado:
+```
+whitenoise==6.9.0
+```
+
+Activar WhiteNoise en `config/settings/production.py`:
+```python
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",  # justo después de SecurityMiddleware
+    # ... resto del middleware
+]
+
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+```
+
+Crear `docker-compose.prod.yml` en la raíz del proyecto:
+```yaml
+services:
+  web:
+    image: registry.digitalocean.com/<DOCR_REGISTRY>/todos:${TAG:-latest}
+    command: >
+      sh -c "python manage.py migrate --no-input &&
+             python manage.py collectstatic --no-input &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2"
+    env_file: .env
+    ports:
+      - "80:8000"
+    restart: unless-stopped
+```
+
+> **Por qué `sh -c` con múltiples comandos:** el contenedor ejecuta migrate y
+> collectstatic antes de levantar Gunicorn. Así el deploy nunca sirve la nueva
+> versión con las migraciones pendientes.
+
+> **Por qué no Nginx separado:** esta app es una REST API pura (solo JSON).
+> WhiteNoise sirve los archivos estáticos del Django Admin directamente desde
+> Gunicorn, sin necesidad de un proxy separado. Para apps con mucho tráfico de
+> assets estáticos, se añadiría Nginx o un CDN.
+
+### 3.8 Preparar los Droplets
 
 Ejecutar en **cada** Droplet (conectado por SSH):
 
@@ -835,40 +906,20 @@ Ejecutar en **cada** Droplet (conectado por SSH):
 # Actualizar el sistema
 apt-get update && apt-get upgrade -y
 
-# Instalar Python 3.12, pip, git y dependencias del sistema
-apt-get install -y python3.12 python3.12-venv python3-pip git libpq-dev nginx
+# Instalar Docker
+curl -fsSL https://get.docker.com | sh
 
-# Verificar versiones
-python3.12 --version
-nginx -v
-
-# Crear usuario no-root para correr la aplicación (buena práctica de seguridad)
-adduser --disabled-password --gecos "" deploy
-# Dar acceso SSH al usuario deploy
-mkdir -p /home/deploy/.ssh
-cp ~/.ssh/authorized_keys /home/deploy/.ssh/
-chown -R deploy:deploy /home/deploy/.ssh
-
-# Crear directorio de la aplicación
-mkdir -p /opt/todos
-chown deploy:deploy /opt/todos
+# Verificar instalación
+docker --version
+docker compose version
 ```
 
-Clonar el repositorio:
+Crear el directorio de la app y el archivo de configuración:
 ```bash
-su - deploy
-cd /opt/todos
-git clone https://github.com/tu-usuario/tu-repo.git .
-
-# Crear entorno virtual
-python3.12 -m venv venv
-source venv/bin/activate
-
-# Instalar dependencias de producción (sin ruff ni otras herramientas de dev)
-pip install -r requirements/production.txt
+mkdir -p /opt/todos
 ```
 
-Crear el archivo `.env` en el servidor (con los datos reales de producción/staging):
+Crear el archivo `.env` en el servidor con los datos reales:
 ```bash
 cat > /opt/todos/.env << 'EOF'
 DJANGO_SETTINGS_MODULE=config.settings.production
@@ -876,85 +927,36 @@ SECRET_KEY=<genera-una-key-aleatoria-segura>
 POSTGRES_DB=todos_staging
 POSTGRES_USER=<usuario-del-cluster-digitalocean>
 POSTGRES_PASSWORD=<password-del-cluster-digitalocean>
-POSTGRES_HOST=<hostname-privado-del-cluster>
+POSTGRES_HOST=<hostname-vpc-del-cluster>
 POSTGRES_PORT=25060
 ALLOWED_HOSTS=<ip-del-droplet>
 EOF
 ```
 
-> **Cómo obtener el hostname privado:** en DigitalOcean, la página del cluster PostgreSQL
-> muestra la "Connection string". El hostname de la red privada termina en `.private`.
-> Usar siempre el hostname privado para que el tráfico no salga a internet.
+> **Cómo obtener el hostname VPC:** en DigitalOcean, en la página del cluster
+> PostgreSQL → Connection details → selecciona "VPC network". El hostname
+> empieza con `private-`. Siempre usar este hostname para que el tráfico no
+> salga a internet.
 
-Aplicar migraciones y recopilar archivos estáticos:
+Copiar `docker-compose.prod.yml` al servidor (o hacerlo via CD automáticamente):
 ```bash
-source /opt/todos/venv/bin/activate
-cd /opt/todos
-python manage.py migrate
-python manage.py collectstatic --no-input
+# Desde tu máquina local
+scp docker-compose.prod.yml root@<IP_DROPLET>:/opt/todos/
 ```
 
-### 3.7 Configurar Gunicorn como servicio systemd
-
-Crear `/etc/systemd/system/todos.service`:
-```ini
-[Unit]
-Description=Gunicorn daemon para todos app
-After=network.target
-
-[Service]
-User=deploy
-Group=deploy
-WorkingDirectory=/opt/todos
-EnvironmentFile=/opt/todos/.env
-ExecStart=/opt/todos/venv/bin/gunicorn \
-    --workers 2 \
-    --bind unix:/opt/todos/todos.sock \
-    config.wsgi:application
-
-[Install]
-WantedBy=multi-user.target
-```
-
+Autenticar Docker en el DOCR para que el Droplet pueda hacer pull de imágenes:
 ```bash
-systemctl daemon-reload
-systemctl enable todos
-systemctl start todos
-systemctl status todos   # debe mostrar "active (running)"
+# En el Droplet — usar el mismo token de DO que se configura en GitHub Secrets
+echo "<DOCR_TOKEN>" | docker login registry.digitalocean.com -u "<DOCR_TOKEN>" --password-stdin
 ```
 
-### 3.8 Configurar Nginx como reverse proxy
+> **El DOCR_TOKEN es un Personal Access Token de DigitalOcean** con scope de
+> lectura/escritura en el registry. Se genera en API → Generate New Token.
 
-Crear `/etc/nginx/sites-available/todos`:
-```nginx
-server {
-    listen 80;
-    server_name <IP_DEL_DROPLET>;  # reemplazar con dominio real si tienes uno
-
-    location /static/ {
-        alias /opt/todos/staticfiles/;
-    }
-
-    location / {
-        proxy_pass http://unix:/opt/todos/todos.sock;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
+Verificar que todo está en su lugar:
 ```bash
-# Activar el sitio
-ln -s /etc/nginx/sites-available/todos /etc/nginx/sites-enabled/
-nginx -t          # verificar que la configuración es válida
-systemctl reload nginx
-```
-
-Verificar que la app responde:
-```bash
-curl http://<IP_DEL_DROPLET>/api/todos/
+ls /opt/todos/
+# debe mostrar: .env  docker-compose.prod.yml
 ```
 
 ---
@@ -972,17 +974,24 @@ Antes de crear los workflows de CD, agregar los secrets en **Settings → Secret
 | `STAGING_HOST` | IP del droplet de staging (ej: `45.55.156.142`) |
 | `PRODUCTION_HOST` | IP del droplet de producción (ej: `174.138.57.232`) |
 | `SSH_PRIVATE_KEY` | Contenido completo de `~/.ssh/id_rsa` (la llave privada) |
+| `DOCR_TOKEN` | Personal Access Token de DigitalOcean con acceso al registry |
+| `DOCR_REGISTRY` | Nombre del registry (ej: `todos-registry`) |
 | `STAGING_DB` | `todos_staging` |
 | `PRODUCTION_DB` | `todos_production` |
 | `POSTGRES_USER` | Usuario del cluster DigitalOcean |
 | `POSTGRES_PASSWORD` | Password del cluster DigitalOcean |
-| `POSTGRES_HOST` | Hostname privado del cluster |
-| `DJANGO_SECRET_KEY` | Secret key segura generada aleatoriamente |
+| `POSTGRES_HOST` | Hostname VPC del cluster (empieza con `private-`) |
+| `STAGING_DJANGO_SECRET_KEY` | Secret key para staging |
+| `PRODUCTION_DJANGO_SECRET_KEY` | Secret key para producción |
 
-> **Generar una SECRET_KEY segura:**
+> **Generar SECRET_KEY seguras (una diferente para staging y otra para producción):**
 > ```bash
 > python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
 > ```
+
+> **Generar el DOCR_TOKEN:** en DigitalOcean → API → Generate New Token.
+> Nombre: `github-actions`. Scopes: lectura y escritura en registry.
+> En el login de Docker, el token se usa tanto como username como password.
 
 ### 4.2 Workflow de CD — Staging
 
@@ -995,28 +1004,58 @@ on:
     branches: [develop]
 
 jobs:
-  deploy:
-    name: Deploy a staging
+  build-and-deploy:
+    name: Build, push y deploy a staging
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout del código
         uses: actions/checkout@v4
 
-      - name: Deploy por SSH
+      # Autenticar en DOCR para poder hacer push de la imagen
+      - name: Login al DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DOCR_TOKEN }}
+          password: ${{ secrets.DOCR_TOKEN }}
+
+      # Construir la imagen y subirla al registry con dos tags:
+      # - staging-latest: siempre apunta a la última versión de staging
+      # - staging-<sha>: tag inmutable para rollback si es necesario
+      - name: Build y push de imagen Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/todos:staging-latest
+            registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/todos:staging-${{ github.sha }}
+
+      # SSH al droplet de staging para bajar la nueva imagen y reiniciar
+      - name: Deploy en staging
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.STAGING_HOST }}
-          username: deploy
+          username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DOCR_TOKEN,DOCR_REGISTRY
           script: |
+            # Autenticar Docker en el registry
+            echo "$DOCR_TOKEN" | docker login registry.digitalocean.com -u "$DOCR_TOKEN" --password-stdin
+
+            # Bajar la nueva imagen
+            docker pull registry.digitalocean.com/$DOCR_REGISTRY/todos:staging-latest
+
+            # Actualizar la variable TAG y reiniciar el contenedor
             cd /opt/todos
-            git pull origin develop
-            source venv/bin/activate
-            pip install -r requirements/production.txt
-            python manage.py migrate --no-input
-            python manage.py collectstatic --no-input
-            sudo systemctl restart todos
+            TAG=staging-latest docker compose -f docker-compose.prod.yml up -d
+
+            # Limpiar imágenes viejas para liberar espacio
+            docker image prune -f
+        env:
+          DOCR_TOKEN: ${{ secrets.DOCR_TOKEN }}
+          DOCR_REGISTRY: ${{ secrets.DOCR_REGISTRY }}
 ```
 
 ### 4.3 Workflow de CD — Producción
@@ -1030,29 +1069,50 @@ on:
     branches: [main]
 
 jobs:
-  deploy:
-    name: Deploy a producción
+  build-and-deploy:
+    name: Build, push y deploy a producción
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout del código
         uses: actions/checkout@v4
 
-      - name: Deploy por SSH
+      - name: Login al DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DOCR_TOKEN }}
+          password: ${{ secrets.DOCR_TOKEN }}
+
+      - name: Build y push de imagen Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/todos:latest
+            registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/todos:${{ github.sha }}
+
+      - name: Deploy en producción
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.PRODUCTION_HOST }}
-          username: deploy
+          username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            echo "$DOCR_TOKEN" | docker login registry.digitalocean.com -u "$DOCR_TOKEN" --password-stdin
+            docker pull registry.digitalocean.com/$DOCR_REGISTRY/todos:latest
             cd /opt/todos
-            git pull origin main
-            source venv/bin/activate
-            pip install -r requirements/production.txt
-            python manage.py migrate --no-input
-            python manage.py collectstatic --no-input
-            sudo systemctl restart todos
+            TAG=latest docker compose -f docker-compose.prod.yml up -d
+            docker image prune -f
+        env:
+          DOCR_TOKEN: ${{ secrets.DOCR_TOKEN }}
+          DOCR_REGISTRY: ${{ secrets.DOCR_REGISTRY }}
 ```
+
+> **Por qué dos tags (`latest` y `<sha>`):** `latest` es conveniente para el
+> deploy normal. El tag con el SHA del commit es inmutable — sirve para hacer
+> rollback a una versión exacta sin tener que reconstruir la imagen.
 
 ### 4.4 Flujo completo end-to-end
 
@@ -1104,18 +1164,22 @@ El load balancer (o el CD workflow) puede verificar que la app está viva antes 
 
 Si un deploy a producción rompe algo:
 ```bash
-# Opción 1: revertir el último commit en main
+# Opción 1 (recomendada): revertir el último commit en main
 git revert HEAD
 git push origin main
-# → CD de producción se dispara automáticamente con el revert
+# → CD de producción se dispara y construye una imagen nueva sin el cambio problemático
 
-# Opción 2: rollback manual en el servidor
-ssh deploy@<IP_PRODUCCION>
+# Opción 2: rollback inmediato en el servidor sin esperar CI/CD
+# Cada imagen tiene un tag con el SHA del commit — úsalo para volver atrás al instante
+ssh root@<IP_PRODUCCION>
 cd /opt/todos
-git log --oneline -5    # identificar el commit bueno
-git checkout <commit-bueno>
-sudo systemctl restart todos
+TAG=<sha-del-commit-bueno> docker compose -f docker-compose.prod.yml up -d
+# La imagen ya está en el Droplet (o se baja del registry en segundos)
 ```
+
+> **Ventaja de Docker sobre el enfoque sin Docker:** el rollback es instantáneo.
+> No hay que reinstalar dependencias ni recompilar nada — la imagen anterior
+> ya existe en el registry y se activa en segundos.
 
 ### Checklist de producción
 
@@ -1126,9 +1190,11 @@ sudo systemctl restart todos
 - [ ] Backups automáticos del Managed PostgreSQL activados
 - [ ] `.env` en `.gitignore` — nunca commitear credenciales
 - [ ] Ramas `main` y `develop` protegidas (requieren PR + CI verde)
-- [ ] Migrations corriendo antes del restart del servidor
-- [ ] Usuario no-root (`deploy`) corriendo la aplicación
-- [ ] Nginx sirviendo archivos estáticos directamente (sin pasar por Django)
+- [ ] Migraciones corriendo dentro del contenedor antes de levantar Gunicorn
+- [ ] `docker-compose.prod.yml` con `restart: unless-stopped` para auto-arranque
+- [ ] WhiteNoise configurado para archivos estáticos
+- [ ] DOCR_TOKEN guardado en GitHub Secrets (no en el código)
+- [ ] Docker login configurado en cada Droplet para hacer pull del registry
 
 ---
 
@@ -1160,19 +1226,32 @@ docker compose exec web python manage.py shell
 
 ```bash
 # Conectar al servidor
-ssh deploy@<IP_DROPLET>
+ssh root@<IP_DROPLET>
 
-# Ver estado de la aplicación
-sudo systemctl status todos
+# Ver estado del contenedor
+cd /opt/todos
+docker compose -f docker-compose.prod.yml ps
 
-# Ver logs de la aplicación
-sudo journalctl -u todos -f
+# Ver logs de la aplicación en tiempo real
+docker compose -f docker-compose.prod.yml logs -f web
 
-# Reiniciar la aplicación
-sudo systemctl restart todos
+# Reiniciar el contenedor manualmente
+docker compose -f docker-compose.prod.yml restart web
 
-# Ver logs de nginx
-sudo tail -f /var/log/nginx/error.log
+# Abrir shell dentro del contenedor (para depuración)
+docker compose -f docker-compose.prod.yml exec web python manage.py shell
+
+# Correr un comando dentro del contenedor
+docker compose -f docker-compose.prod.yml exec web python manage.py migrate
+
+# Ver todas las imágenes descargadas en el servidor
+docker images
+
+# Rollback a una versión anterior
+TAG=<sha-del-commit> docker compose -f docker-compose.prod.yml up -d
+
+# Liberar espacio eliminando imágenes sin uso
+docker image prune -f
 ```
 
 ### Estructura de archivos final
@@ -1218,6 +1297,7 @@ my_first_ci_cd_pipeline/
 ├── .env.example                # Plantilla documentada (va a git)
 ├── .gitignore
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml          # Desarrollo local
+├── docker-compose.prod.yml     # Producción/staging (usa imagen del registry)
 └── manage.py
 ```
