@@ -34,6 +34,9 @@ jobs:
         with:
           context: .
           push: true
+          # linux/amd64 evita generar manifest multi-plataforma,
+          # produciendo una sola entrada en el registry por tag
+          platforms: linux/amd64
           tags: |
             registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/todos:latest
             registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/todos:${{ github.sha }}
