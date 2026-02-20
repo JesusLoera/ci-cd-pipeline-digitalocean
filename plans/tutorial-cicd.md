@@ -1114,6 +1114,17 @@ jobs:
 > deploy normal. El tag con el SHA del commit es inmutable — sirve para hacer
 > rollback a una versión exacta sin tener que reconstruir la imagen.
 
+### Errores comunes en Fase 3 y 4
+
+| Error | Causa | Solución |
+|-------|-------|----------|
+| `denied: requested access to the resource is denied` al hacer push a DOCR | El Personal Access Token de DigitalOcean solo tiene scopes `create` y `read`, falta `update` | Regenerar el token con los tres scopes: **create + read + update**. En DO los scopes de registry no se llaman "write" — "update" es el equivalente a push |
+| `ssh: this private key is passphrase protected` / `unable to authenticate` | La llave SSH configurada en `SSH_PRIVATE_KEY` tiene passphrase — los workflows automatizados no pueden escribirla | Generar una llave dedicada sin passphrase: `ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/id_ed25519_deploy -N ""`. Agregar la pública a `~/.ssh/authorized_keys` de cada Droplet y guardar la privada en el secret `SSH_PRIVATE_KEY` |
+| `The "DOCR_REGISTRY" variable is not set` (warning en el servidor) | `docker compose` lee variables del shell y `DOCR_REGISTRY` no está exportada en la sesión SSH interactiva | Es solo un warning, no rompe nada — el nombre de la imagen ya está hardcodeado en la imagen descargada. Para eliminarlo, exportar `DOCR_REGISTRY` antes del comando o ignorarlo |
+| `Failed to connect to <IP> port 80` inmediatamente después del deploy | El contenedor aún está ejecutando migraciones y `collectstatic` antes de levantar Gunicorn — tarda ~20-30 segundos | Esperar unos segundos y reintentar el `curl` |
+| Conflicto en PR `develop → main` en `production.py` | `main` tenía `SECURE_SSL_REDIRECT = True` y `develop` lo cambió a `False` | Elegir la versión de `develop` (`False`) — con `True` y sin HTTPS la app queda inaccesible. Activar de nuevo cuando Certbot esté configurado |
+| Storage del DOCR al límite (500 MB plan Starter) | Los re-runs por errores generan imágenes huérfanas (`none`) que ocupan espacio | Hacer **Empty garbage** desde el panel de DOCR regularmente para liberar las capas sin referencia |
+
 ### 4.4 Flujo completo end-to-end
 
 ```
